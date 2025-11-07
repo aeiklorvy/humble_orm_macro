@@ -1,0 +1,19 @@
+[package]
+name = "humble_orm_macro"
+version = "0.1.0"
+edition = "2024"
+categories = ["database"]
+keywords = ["sqlx", "orm"]
+description = "A crate with proc-macro for humble-orm, its use alone is meaningless"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aeiklorvy/humble_orm_macro"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = "2.0"
+sqlparser = "0.59"
+convert_case = "0.8"
+quote = "1.0"
+proc-macro2 = "1.0"

@@ -71,10 +71,20 @@ struct TableRelation {
     rel_column: String,
 }
 
-#[derive(Default)]
 struct TableDef {
     cols: Vec<TableColumn>,
     rels: Vec<TableRelation>,
+    create_stmt: sqlparser::ast::Statement,
+}
+
+impl TableDef {
+    fn primary_col(&self) -> Option<&TableColumn> {
+        self.cols.iter().find(|col| col.is_primary)
+    }
+
+    fn primary_col_name(&self) -> Option<&str> {
+        self.primary_col().map(|col| col.name.as_str())
+    }
 }
 
 // use BTreeMap to keep insertion order
@@ -93,7 +103,7 @@ fn parse_sql(
             columns,
             constraints,
             ..
-        }) = stmt
+        }) = &stmt
         {
             let table_name = name
                 .to_string()
@@ -101,17 +111,21 @@ fn parse_sql(
                 .replace('\"', "")
                 .replace('\'', "");
 
-            let table_def = tables.entry(table_name).or_insert(TableDef::default());
+            let table_def = tables.entry(table_name).or_insert(TableDef {
+                cols: vec![],
+                rels: vec![],
+                create_stmt: stmt.clone(),
+            });
             for col in columns {
-                let is_primary = is_column_primary(&col);
-                let is_nullable = is_column_nullable(&col);
+                let is_primary = is_column_primary(col);
+                let is_nullable = is_column_nullable(col);
 
-                let mut column_type = convert_sql_type(col.data_type);
+                let mut column_type = convert_sql_type(&col.data_type);
                 if is_nullable {
                     column_type = quote! { Option<#column_type> };
                 }
                 table_def.cols.push(TableColumn {
-                    name: col.name.value,
+                    name: col.name.value.clone(),
                     type_: column_type,
                     is_primary,
                 });
@@ -149,12 +163,11 @@ fn write_structs(tables: TableMap, driver: Driver) -> proc_macro2::TokenStream {
     for (table, def) in tables {
         let table_escaped = format!("{table:?}");
         let t = quote::format_ident!("{}", table.to_case(Case::Pascal));
-        let primary_col: Option<&TableColumn> = def.cols.iter().find(|c| c.is_primary);
 
         let mut struct_fields = vec![];
         let mut default_values = vec![];
         for column in &def.cols {
-            let field_name = quote::format_ident!("{}", column.name);
+            let field_name = quote::format_ident!("{}", column.name.to_case(Case::Snake));
             let col_type = &column.type_;
 
             struct_fields.push(quote! {
@@ -195,33 +208,20 @@ fn write_structs(tables: TableMap, driver: Driver) -> proc_macro2::TokenStream {
             pub const ALL: SqlColumn = SqlColumn::new("*", #table_escaped);
         });
 
-        let related_funcs: Vec<_> = def
+        let fns_related: Vec<_> = def
             .rels
             .iter()
             .map(|rel| gen_get_related_by(driver, &rel))
             .collect();
-        let get_by_primary_key = match primary_col {
-            Some(id_col) => gen_get_by_primary_key(driver, &table, &id_col.name, &id_col.type_),
-            None => quote! {},
-        };
-        let update_fn = match primary_col {
-            Some(id_col) => gen_update(driver, &table, &def.cols, &id_col.name),
-            None => quote! {},
-        };
-        let delete_fn = match primary_col {
-            Some(id_col) => gen_delete(driver, &table, &id_col.name),
-            None => quote! {},
-        };
-        let insert_without_pk_fn = match primary_col {
-            Some(id_col) => gen_insert_without_pk(driver, &table, &def.cols, id_col),
-            None => quote! {},
-        };
-        let insert_fn = gen_insert(driver, &table, &def.cols);
-        let select_func = gen_select_all(driver, &table);
-        let cols_from_row = gen_column_from_row(driver, &def.cols);
+        let fn_get_by_primary_key = gen_get_by_primary_key(driver, &table, &def);
+        let fn_update = gen_update(driver, &table, &def);
+        let fn_delete = gen_delete(driver, &table, &def);
+        let fn_insert_without_pk = gen_insert_without_pk(driver, &table, &def);
+        let fn_insert = gen_insert(driver, &table, &def);
+        let fn_select = gen_select_all(driver, &table);
+        let fns_col_from_row = gen_column_from_row(driver, &def);
+        let fn_create = gen_create_table(driver, &def);
 
-        let primary_col_name: &str = primary_col.map(|col| col.name.as_ref()).unwrap_or_default();
-        let primary_col_name_escaped = format!("{primary_col_name:?}");
         structs.push(quote! {
             #[derive(Clone, Debug, sqlx::FromRow)]
             pub struct #t {
@@ -231,9 +231,6 @@ fn write_structs(tables: TableMap, driver: Driver) -> proc_macro2::TokenStream {
             impl SqlTable for #t {
                 fn table_name() -> &'static str {
                     #table_escaped
-                }
-                fn id_column_name() -> &'static str {
-                    #primary_col_name_escaped
                 }
             }
 
@@ -247,14 +244,15 @@ fn write_structs(tables: TableMap, driver: Driver) -> proc_macro2::TokenStream {
 
             impl #t {
                 #(#meta_columns)*
-                #(#related_funcs)*
-                #get_by_primary_key
-                #select_func
-                #update_fn
-                #insert_fn
-                #insert_without_pk_fn
-                #delete_fn
-                #cols_from_row
+                #(#fns_related)*
+                #fn_get_by_primary_key
+                #fn_select
+                #fn_update
+                #fn_insert
+                #fn_insert_without_pk
+                #fn_delete
+                #fns_col_from_row
+                #fn_create
             }
         });
     }
@@ -262,7 +260,7 @@ fn write_structs(tables: TableMap, driver: Driver) -> proc_macro2::TokenStream {
     quote! { #(#structs)* }
 }
 
-fn convert_sql_type(dt: sqlparser::ast::DataType) -> proc_macro2::TokenStream {
+fn convert_sql_type(dt: &sqlparser::ast::DataType) -> proc_macro2::TokenStream {
     match dt {
         sqlparser::ast::DataType::Character(_)
         | sqlparser::ast::DataType::Char(_)
@@ -377,22 +375,27 @@ fn is_column_nullable(col: &sqlparser::ast::ColumnDef) -> bool {
 fn gen_get_by_primary_key(
     driver: Driver,
     table: &str,
-    primary_col_name: &str,
-    key_type: &proc_macro2::TokenStream,
+    table_def: &TableDef,
 ) -> proc_macro2::TokenStream {
-    let pool = quote::format_ident!("{}", driver.as_str());
-    let sql = format!("SELECT * FROM {table:?} WHERE {primary_col_name:?} = ?");
+    if let Some(id_col) = table_def.primary_col() {
+        let primary_col_name = id_col.name.as_str();
+        let key_type = &id_col.type_;
+        let pool = quote::format_ident!("{}", driver.as_str());
+        let sql = format!("SELECT * FROM {table:?} WHERE {primary_col_name:?} = ?");
 
-    quote! {
-        /// Selects a row from the database where the primary key corresponds
-        /// to the specified value
-        pub async fn get_by_primary_key(pool: &sqlx::#pool, key: #key_type) -> Option<Self> {
-            sqlx::query_as(#sql)
-                .bind(&key)
-                .fetch_one(pool)
-                .await
-                .ok()
+        quote! {
+            /// Selects a row from the database where the primary key corresponds
+            /// to the specified value
+            pub async fn get_by_primary_key(pool: &sqlx::#pool, key: #key_type) -> Option<Self> {
+                sqlx::query_as(#sql)
+                    .bind(&key)
+                    .fetch_one(pool)
+                    .await
+                    .ok()
+            }
         }
+    } else {
+        quote! {}
     }
 }
 
@@ -450,13 +453,14 @@ fn gen_select_all(driver: Driver, table: &str) -> proc_macro2::TokenStream {
     }
 }
 
-fn gen_update(
-    driver: Driver,
-    table: &str,
-    table_cols: &[TableColumn],
-    primary_col_name: &str,
-) -> proc_macro2::TokenStream {
-    let update_cols = table_cols
+fn gen_update(driver: Driver, table: &str, table_def: &TableDef) -> proc_macro2::TokenStream {
+    if table_def.primary_col().is_none() {
+        return quote! {};
+    }
+
+    let primary_col_name = table_def.primary_col_name().unwrap_or_default();
+    let update_cols = table_def
+        .cols
         .iter()
         .filter(|col| !col.is_primary)
         .map(|col| format!("{:?} = ?", col.name))
@@ -466,7 +470,7 @@ fn gen_update(
     let sql = format!("UPDATE {table:?} SET {update_cols} WHERE {primary_col_name:?} = ?");
 
     let mut bind_values: Vec<proc_macro2::TokenStream> = vec![];
-    for col in table_cols {
+    for col in &table_def.cols {
         if col.is_primary {
             continue;
         }
@@ -491,21 +495,22 @@ fn gen_update(
     }
 }
 
-fn gen_insert(driver: Driver, table: &str, table_cols: &[TableColumn]) -> proc_macro2::TokenStream {
-    let fields = table_cols
+fn gen_insert(driver: Driver, table: &str, table_def: &TableDef) -> proc_macro2::TokenStream {
+    let fields = table_def
+        .cols
         .iter()
         .map(|col| format!("{:?}", col.name))
         .collect::<Vec<_>>()
         .join(",");
-    let placeholders = std::iter::repeat_n("?", table_cols.len())
+    let placeholders = std::iter::repeat_n("?", table_def.cols.len())
         .collect::<Vec<_>>()
         .join(",");
 
     let sql = format!("INSERT INTO {table:?} ({fields}) VALUES ({placeholders})");
 
     let mut binds = vec![];
-    for col in table_cols {
-        let field_name = quote::format_ident!("{}", col.name);
+    for col in &table_def.cols {
+        let field_name = quote::format_ident!("{}", col.name.to_case(Case::Snake));
         binds.push(quote! { self.#field_name });
     }
 
@@ -526,36 +531,43 @@ fn gen_insert(driver: Driver, table: &str, table_cols: &[TableColumn]) -> proc_m
 fn gen_insert_without_pk(
     driver: Driver,
     table: &str,
-    table_cols: &[TableColumn],
-    primary_col: &TableColumn,
+    table_def: &TableDef,
 ) -> proc_macro2::TokenStream {
+    if table_def.primary_col().is_none() {
+        return quote! {};
+    }
+    // SAFETY: this has already been checked in the line above
+    let primary_col = unsafe { table_def.primary_col().unwrap_unchecked() };
+
     if matches!(driver, Driver::MySql | Driver::Sqlite)
-        && !matches!(primary_col.type_.to_string().as_str(), "i64" | "u64")
+        && !matches!(primary_col.type_.to_string().as_str(), "i64" | "u64" | "Option<i64>" | "Option<u64>")
     {
         // non-integer primary keys not supported, becasue of
         // `last_return_id` and `last_return_rowid` functions
         return quote! {};
     }
 
-    let fields = table_cols
+    let fields = table_def
+        .cols
         .iter()
         .filter(|col| !col.is_primary)
         .map(|col| format!("{:?}", col.name))
         .collect::<Vec<_>>()
         .join(",");
 
-    let placeholders = std::iter::repeat_n("?", table_cols.len() - 1)
+    // `len - 1` because it is known for sure that the primary key is there
+    let placeholders = std::iter::repeat_n("?", table_def.cols.len() - 1)
         .collect::<Vec<_>>()
         .join(",");
 
     let mut sql = format!("INSERT INTO {table:?} ({fields}) VALUES ({placeholders})");
 
     let mut binds = vec![];
-    for col in table_cols {
+    for col in &table_def.cols {
         if col.is_primary {
             continue;
         }
-        let field_name = quote::format_ident!("{}", col.name);
+        let field_name = quote::format_ident!("{}", col.name.to_case(Case::Snake));
         binds.push(quote! { self.#field_name });
     }
 
@@ -607,24 +619,28 @@ fn gen_insert_without_pk(
     }
 }
 
-fn gen_delete(driver: Driver, table: &str, primary_col_name: &str) -> proc_macro2::TokenStream {
-    let id_field = quote::format_ident!("{}", primary_col_name);
-    let pool = quote::format_ident!("{}", driver.as_str());
+fn gen_delete(driver: Driver, table: &str, table_def: &TableDef) -> proc_macro2::TokenStream {
+    if let Some(id_col) = table_def.primary_col() {
+        let id_field = quote::format_ident!("{}", id_col.name);
+        let pool = quote::format_ident!("{}", driver.as_str());
 
-    let sql = format!("DELETE FROM {table:?} WHERE {primary_col_name:?} = ?");
+        let sql = format!("DELETE FROM {table:?} WHERE {:?} = ?", id_col.name);
 
-    quote! {
-        pub async fn delete(self, pool: &sqlx::#pool) {
-            sqlx::query(#sql)
-                .bind(&self.#id_field)
-                .execute(pool)
-                .await
-                .unwrap();
+        quote! {
+            pub async fn delete(self, pool: &sqlx::#pool) {
+                sqlx::query(#sql)
+                    .bind(&self.#id_field)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
         }
+    } else {
+        quote! {}
     }
 }
 
-fn gen_column_from_row(driver: Driver, table_cols: &[TableColumn]) -> proc_macro2::TokenStream {
+fn gen_column_from_row(driver: Driver, table_def: &TableDef) -> proc_macro2::TokenStream {
     let row_type = match driver {
         Driver::MySql => quote! { sqlx::mysql::MySqlRow },
         Driver::Postgre => quote! { sqlx::postgres::PgRow },
@@ -632,7 +648,7 @@ fn gen_column_from_row(driver: Driver, table_cols: &[TableColumn]) -> proc_macro
     };
 
     let mut funcs = vec![];
-    for col in table_cols {
+    for col in &table_def.cols {
         let get_fn_name = quote::format_ident!("{}_from_row", col.name.to_case(Case::Snake));
         let try_get_fn_name =
             quote::format_ident!("{}_try_from_row", col.name.to_case(Case::Snake));
@@ -652,4 +668,19 @@ fn gen_column_from_row(driver: Driver, table_cols: &[TableColumn]) -> proc_macro
     }
 
     quote! { #(#funcs)* }
+}
+
+fn gen_create_table(driver: Driver, table_def: &TableDef) -> proc_macro2::TokenStream {
+    let pool = quote::format_ident!("{}", driver.as_str());
+    let sql = table_def.create_stmt.to_string();
+
+    quote! {
+        /// Creates a new table in the database
+        pub async fn create_table(self, pool: &sqlx::#pool) {
+            sqlx::query(#sql)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
 }

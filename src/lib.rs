@@ -2,6 +2,9 @@ use convert_case::{Case, Casing};
 use quote::quote;
 use std::{collections::BTreeMap, error::Error};
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Driver {
     MySql,
@@ -17,45 +20,42 @@ impl Driver {
             Driver::Sqlite => "SqlitePool",
         }
     }
+
+    fn as_dialect<'a>(&self) -> &'a dyn sqlparser::dialect::Dialect {
+        match self {
+            Driver::MySql => &sqlparser::dialect::MySqlDialect {},
+            Driver::Postgre => &sqlparser::dialect::PostgreSqlDialect {},
+            Driver::Sqlite => &sqlparser::dialect::SQLiteDialect {},
+        }
+    }
 }
 
 #[proc_macro]
 pub fn generate_structs_mysql(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input_string = input.to_string();
-    match parse_sql(&sqlparser::dialect::MySqlDialect {}, &input_string) {
-        Ok(tables) => write_structs(tables, Driver::MySql),
-        Err(err) => {
-            let e = err.to_string();
-            quote! { compile_error!(#e) }
-        }
-    }
-    .into()
+    generate_structs_impl(Driver::MySql, &input_string).into()
 }
 
 #[proc_macro]
 pub fn generate_structs_psql(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input_string = input.to_string();
-    match parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, &input_string) {
-        Ok(tables) => write_structs(tables, Driver::Postgre),
-        Err(err) => {
-            let e = err.to_string();
-            quote! { compile_error!(#e) }
-        }
-    }
-    .into()
+    generate_structs_impl(Driver::Postgre, &input_string).into()
 }
 
 #[proc_macro]
 pub fn generate_structs_sqlite(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input_string = input.to_string();
-    match parse_sql(&sqlparser::dialect::SQLiteDialect {}, &input_string) {
-        Ok(tables) => write_structs(tables, Driver::Sqlite),
+    generate_structs_impl(Driver::Sqlite, &input_string).into()
+}
+
+fn generate_structs_impl(driver: Driver, sql: &str) -> proc_macro2::TokenStream {
+    match parse_sql(driver.as_dialect(), sql) {
+        Ok(tables) => write_structs(tables, driver),
         Err(err) => {
             let e = err.to_string();
             quote! { compile_error!(#e) }
         }
     }
-    .into()
 }
 
 #[derive(Default)]
@@ -162,51 +162,18 @@ fn write_structs(tables: TableMap, driver: Driver) -> proc_macro2::TokenStream {
 
     for (table, def) in tables {
         let table_escaped = format!("{table:?}");
-        let t = quote::format_ident!("{}", table.to_case(Case::Pascal));
 
-        let mut struct_fields = vec![];
-        let mut default_values = vec![];
+        let fields = gen_model_fields(&def);
+        let default_impl = gen_default_impl(&table, &def);
+        let column_entities = gen_sql_columns(&table, &def);
+
+        let mut all_columns = vec![];
         for column in &def.cols {
-            let field_name = quote::format_ident!("{}", column.name.to_case(Case::Snake));
-            let col_type = &column.type_;
-
-            struct_fields.push(quote! {
-                pub #field_name: #col_type,
-            });
-
-            // can't write #[derive(Default)] because of the `time` crate,
-            // which does not implement a Default trait for its types
-            if col_type.to_string().ends_with("Date") {
-                default_values.push(quote! {
-                    #field_name: sqlx::types::time::Date::MIN,
-                });
-            } else if col_type.to_string().ends_with("PrimitiveDateTime") {
-                default_values.push(quote! {
-                    #field_name: sqlx::types::time::PrimitiveDateTime::MIN,
-                });
-            } else if col_type.to_string().ends_with("Time") {
-                default_values.push(quote! {
-                    #field_name: sqlx::types::time::Time::MIDNIGHT,
-                });
-            } else {
-                default_values.push(quote! {
-                    #field_name: Default::default(),
-                });
-            }
+            // it represents information about the column's entity, so it's
+            // more logical to present it in PascalCase (as with data types)
+            let field_name = quote::format_ident!("{}", column.name.to_case(Case::Pascal));
+            all_columns.push(quote! { #field_name });
         }
-
-        let mut meta_columns = vec![];
-        for column in &def.cols {
-            let field_name = quote::format_ident!("{}", column.name.to_case(Case::UpperSnake));
-            // use debug trait to escape
-            let col_name = format!("{:?}", column.name);
-            meta_columns.push(quote! {
-                pub const #field_name: SqlColumn = SqlColumn::new(#col_name, #table_escaped);
-            });
-        }
-        meta_columns.push(quote! {
-            pub const ALL: SqlColumn = SqlColumn::new("*", #table_escaped);
-        });
 
         let fns_related: Vec<_> = def
             .rels
@@ -219,31 +186,28 @@ fn write_structs(tables: TableMap, driver: Driver) -> proc_macro2::TokenStream {
         let fn_insert_without_pk = gen_insert_without_pk(driver, &table, &def);
         let fn_insert = gen_insert(driver, &table, &def);
         let fn_select = gen_select_all(driver, &table);
-        let fns_col_from_row = gen_column_from_row(driver, &def);
         let fn_create = gen_create_table(driver, &def);
+        let fn_drop = gen_drop_table(driver, &table);
 
+        let type_mod = gen_column_type_mod(&table, &def);
+
+        let t = quote::format_ident!("{}", table.to_case(Case::Pascal));
         structs.push(quote! {
             #[derive(Clone, Debug, sqlx::FromRow)]
             pub struct #t {
-                #(#struct_fields)*
+                #(#fields)*
             }
+
+            #default_impl
 
             impl SqlTable for #t {
-                fn table_name() -> &'static str {
-                    #table_escaped
-                }
+                const TABLE_NAME: &'static str = #table_escaped;
+                const COLUMNS: &'static [SqlColumn] = &[#( Self:: #all_columns , )*];
             }
 
-            impl Default for #t {
-                fn default() -> Self {
-                    Self {
-                        #(#default_values)*
-                    }
-                }
-            }
-
+            #[allow(non_upper_case_globals)]
             impl #t {
-                #(#meta_columns)*
+                #(#column_entities)*
                 #(#fns_related)*
                 #fn_get_by_primary_key
                 #fn_select
@@ -251,9 +215,11 @@ fn write_structs(tables: TableMap, driver: Driver) -> proc_macro2::TokenStream {
                 #fn_insert
                 #fn_insert_without_pk
                 #fn_delete
-                #fns_col_from_row
                 #fn_create
+                #fn_drop
             }
+
+            #type_mod
         });
     }
 
@@ -372,6 +338,107 @@ fn is_column_nullable(col: &sqlparser::ast::ColumnDef) -> bool {
     true
 }
 
+fn gen_model_fields(table_def: &TableDef) -> Vec<proc_macro2::TokenStream> {
+    let mut struct_fields = vec![];
+    for column in &table_def.cols {
+        let cased_name = column.name.to_case(Case::Snake);
+        let field_name = quote::format_ident!("{}", cased_name);
+        let col_type = &column.type_;
+
+        if cased_name == column.name {
+            struct_fields.push(quote! {
+                pub #field_name: #col_type,
+            });
+        } else {
+            let sql_name = column.name.as_str();
+            struct_fields.push(quote! {
+                #[sqlx(rename = #sql_name)]
+                pub #field_name: #col_type,
+            });
+        }
+    }
+
+    struct_fields
+}
+
+fn gen_default_impl(table: &str, table_def: &TableDef) -> proc_macro2::TokenStream {
+    // can't write #[derive(Default)] because of the `time` crate,
+    // which does not implement a Default trait for its types
+
+    let mut default_values = vec![];
+    for column in &table_def.cols {
+        let field_name = quote::format_ident!("{}", column.name.to_case(Case::Snake));
+        let col_type = column.type_.to_string();
+
+        if col_type == quote! {sqlx::types::time::Date}.to_string() {
+            // default is "0000-01-01"
+            default_values.push(quote! {
+                    #field_name: unsafe { sqlx::types::time::Date::__from_ordinal_date_unchecked(0, 1) },
+                });
+        } else if col_type == quote! {sqlx::types::time::PrimitiveDateTime}.to_string() {
+            // default is "0000-01-01 00:00:00"
+            default_values.push(quote! {
+                #field_name: sqlx::types::time::PrimitiveDateTime::new(
+                    unsafe { sqlx::types::time::Date::__from_ordinal_date_unchecked(0, 1) },
+                    sqlx::types::time::Time::MIDNIGHT
+                ),
+            });
+        } else if col_type == quote! {sqlx::types::time::Time}.to_string() {
+            // default is "00:00:00"
+            default_values.push(quote! {
+                #field_name: sqlx::types::time::Time::MIDNIGHT,
+            });
+        } else {
+            default_values.push(quote! {
+                #field_name: Default::default(),
+            });
+        }
+    }
+
+    let t = quote::format_ident!("{}", table.to_case(Case::Pascal));
+    quote! {
+        impl Default for #t {
+            fn default() -> Self {
+                Self {
+                    #(#default_values)*
+                }
+            }
+        }
+    }
+}
+
+fn gen_sql_columns(table: &str, table_def: &TableDef) -> Vec<proc_macro2::TokenStream> {
+    let table_escaped = format!("{table:?}");
+    let mut consts = vec![];
+    for column in &table_def.cols {
+        // it represents information about the column's entity, so it's
+        // more logical to present it in PascalCase (as with data types)
+        let field_name = quote::format_ident!("{}", column.name.to_case(Case::Pascal));
+        // use debug trait to escape
+        let col_name = format!("{:?}", column.name);
+        let is_primary = match column.is_primary {
+            true => quote! { true },
+            false => quote! { false },
+        };
+        consts.push(quote! {
+            /// Information about the table column
+            pub const #field_name: SqlColumn = unsafe {
+                SqlColumn::new(#col_name, #table_escaped, #is_primary)
+            };
+        });
+    }
+
+    let docs = format!("A special column representing the entire table: `{table:?}.*`");
+    consts.push(quote! {
+        #[doc = #docs]
+        pub const ALL: SqlColumn = unsafe {
+            SqlColumn::new("*", #table_escaped, false)
+        };
+    });
+
+    consts
+}
+
 fn gen_get_by_primary_key(
     driver: Driver,
     table: &str,
@@ -386,12 +453,11 @@ fn gen_get_by_primary_key(
         quote! {
             /// Selects a row from the database where the primary key corresponds
             /// to the specified value
-            pub async fn get_by_primary_key(pool: &sqlx::#pool, key: #key_type) -> Option<Self> {
+            pub async fn get_by_primary_key(pool: &sqlx::#pool, key: #key_type) -> std::result::Result<Self, sqlx::Error> {
                 sqlx::query_as(#sql)
                     .bind(&key)
                     .fetch_one(pool)
                     .await
-                    .ok()
             }
         }
     } else {
@@ -419,21 +485,19 @@ fn gen_get_related_by(driver: Driver, rel: &TableRelation) -> proc_macro2::Token
     quote! {
         /// Selects a row of the related table according to the foreign key
         /// and field value in the model
-        pub async fn #fn_name(&self, pool: &sqlx::#pool) -> Option<#model> {
+        pub async fn #fn_name(&self, pool: &sqlx::#pool) -> std::result::Result<#model, sqlx::Error> {
             sqlx::query_as(#sql_one)
                 .bind(&self.#ref_field)
                 .fetch_one(pool)
                 .await
-                .ok()
         }
         /// Selects all rows of the related table according to the foreign key
         /// and field value in the model
-        pub async fn #fn_name_all(&self, pool: &sqlx::#pool) -> Vec<#model> {
+        pub async fn #fn_name_all(&self, pool: &sqlx::#pool) -> std::result::Result<std::vec::Vec<#model>, sqlx::Error> {
             sqlx::query_as(#sql_many)
                 .bind(&self.#ref_field)
                 .fetch_all(pool)
                 .await
-                .unwrap_or_default()
         }
     }
 }
@@ -444,11 +508,10 @@ fn gen_select_all(driver: Driver, table: &str) -> proc_macro2::TokenStream {
 
     quote! {
         /// Selects all table rows from the database
-        pub async fn select_all(pool: &sqlx::#pool) -> Vec<Self> {
+        pub async fn select_all(pool: &sqlx::#pool) -> std::result::Result<std::vec::Vec<Self>, sqlx::Error> {
             sqlx::query_as(#sql)
                 .fetch_all(pool)
                 .await
-                .unwrap_or_default()
         }
     }
 }
@@ -484,13 +547,13 @@ fn gen_update(driver: Driver, table: &str, table_def: &TableDef) -> proc_macro2:
 
     quote! {
         /// Updates a row in the database that corresponds to the value of the
-        /// primary key field.
-        pub async fn update(&self, pool: &sqlx::#pool) {
+        /// primary key field
+        pub async fn update(&self, pool: &sqlx::#pool) -> std::result::Result<(), sqlx::Error> {
             sqlx::query(#sql)
                 #( .bind(&#bind_values) )*
                 .execute(pool)
-                .await
-                .unwrap();
+                .await?;
+            Ok(())
         }
     }
 }
@@ -518,12 +581,12 @@ fn gen_insert(driver: Driver, table: &str, table_def: &TableDef) -> proc_macro2:
 
     quote! {
         /// Inserts a record via `INSERT` by sending all columns of the model
-        pub async fn insert(&self, pool: &sqlx::#pool) {
+        pub async fn insert(&self, pool: &sqlx::#pool) -> std::result::Result<(), sqlx::Error> {
             sqlx::query(#sql)
                 #( .bind(&#binds) )*
                 .execute(pool)
-                .await
-                .unwrap();
+                .await?;
+            Ok(())
         }
     }
 }
@@ -540,7 +603,10 @@ fn gen_insert_without_pk(
     let primary_col = unsafe { table_def.primary_col().unwrap_unchecked() };
 
     if matches!(driver, Driver::MySql | Driver::Sqlite)
-        && !matches!(primary_col.type_.to_string().as_str(), "i64" | "u64" | "Option<i64>" | "Option<u64>")
+        && primary_col.type_.to_string() != quote! {i64}.to_string()
+        && primary_col.type_.to_string() != quote! {u64}.to_string()
+        && primary_col.type_.to_string() != quote! {Option<i64>}.to_string()
+        && primary_col.type_.to_string() != quote! {Option<u64>}.to_string()
     {
         // non-integer primary keys not supported, becasue of
         // `last_return_id` and `last_return_rowid` functions
@@ -580,9 +646,9 @@ fn gen_insert_without_pk(
                 let result: sqlx::mysql::MySqlQueryResult = sqlx::query(#sql)
                     #( .bind(&#binds) )*
                     .execute(pool)
-                    .await
-                    .unwrap();
+                    .await?;
                 self.#id_field = result.last_insert_id().into();
+                Ok(())
             }
         }
         Driver::Postgre => {
@@ -592,9 +658,9 @@ fn gen_insert_without_pk(
                 let row = sqlx::query(#sql)
                     #( .bind(&#binds) )*
                     .fetch_one(pool)
-                    .await
-                    .unwrap();
+                    .await?;
                 self.#id_field = row.get(0);
+                Ok(())
             }
         }
         Driver::Sqlite => {
@@ -602,9 +668,9 @@ fn gen_insert_without_pk(
                 let result: sqlx::sqlite::SqliteQueryResult = sqlx::query(#sql)
                     #( .bind(&#binds) )*
                     .execute(pool)
-                    .await
-                    .unwrap();
+                    .await?;
                 self.#id_field = result.last_insert_rowid().into();
+                Ok(())
             }
         }
     };
@@ -612,8 +678,8 @@ fn gen_insert_without_pk(
     quote! {
         /// Inserts a record via `INSERT`, skipping the primary key field, and
         /// after insertion sets the primary key value from the DBMS to the
-        /// model.
-        pub async fn insert_generating_primary_key(&mut self, pool: &sqlx::#pool) {
+        /// model
+        pub async fn insert_generating_primary_key(&mut self, pool: &sqlx::#pool) -> std::result::Result<(), sqlx::Error> {
             #fn_body
         }
     }
@@ -627,12 +693,14 @@ fn gen_delete(driver: Driver, table: &str, table_def: &TableDef) -> proc_macro2:
         let sql = format!("DELETE FROM {table:?} WHERE {:?} = ?", id_col.name);
 
         quote! {
-            pub async fn delete(self, pool: &sqlx::#pool) {
+            /// Deletes a row in the database that corresponds to the value of
+            /// the primary key field, and the model will be consumed
+            pub async fn delete(self, pool: &sqlx::#pool) -> std::result::Result<(), sqlx::Error> {
                 sqlx::query(#sql)
                     .bind(&self.#id_field)
                     .execute(pool)
-                    .await
-                    .unwrap();
+                    .await?;
+                Ok(())
             }
         }
     } else {
@@ -640,34 +708,31 @@ fn gen_delete(driver: Driver, table: &str, table_def: &TableDef) -> proc_macro2:
     }
 }
 
-fn gen_column_from_row(driver: Driver, table_def: &TableDef) -> proc_macro2::TokenStream {
-    let row_type = match driver {
-        Driver::MySql => quote! { sqlx::mysql::MySqlRow },
-        Driver::Postgre => quote! { sqlx::postgres::PgRow },
-        Driver::Sqlite => quote! { sqlx::sqlite::SqliteRow },
-    };
+fn gen_column_type_mod(table: &str, table_def: &TableDef) -> proc_macro2::TokenStream {
+    // Right now, I can't just add type alias to the implementation,
+    // because inherent associated types are unstable:
+    // impl #table {
+    //     pub type #col = #type;
+    // }
+    //
+    // Therefore, I am generating a separate module that contains
+    // type aliases for each column
 
-    let mut funcs = vec![];
-    for col in &table_def.cols {
-        let get_fn_name = quote::format_ident!("{}_from_row", col.name.to_case(Case::Snake));
-        let try_get_fn_name =
-            quote::format_ident!("{}_try_from_row", col.name.to_case(Case::Snake));
-        let col_type = &col.type_;
-        let col_name = col.name.as_str();
-
-        funcs.push(quote! {
-            pub fn #get_fn_name(row: &#row_type) -> #col_type {
-                use sqlx::Row;
-                row.get(#col_name)
-            }
-            pub fn #try_get_fn_name(row: &#row_type) -> Result<#col_type, sqlx::Error> {
-                use sqlx::Row;
-                row.try_get(#col_name)
-            }
+    let mut items = vec![];
+    for column in &table_def.cols {
+        let name = quote::format_ident!("{}Type", column.name.to_case(Case::Pascal));
+        let col_type = &column.type_;
+        items.push(quote! {
+            pub type #name = #col_type;
         });
     }
 
-    quote! { #(#funcs)* }
+    let mod_name = quote::format_ident!("{}ColumnTypes", table.to_case(Case::Pascal));
+    quote! {
+        pub mod #mod_name {
+            #( #items )*
+        }
+    }
 }
 
 fn gen_create_table(driver: Driver, table_def: &TableDef) -> proc_macro2::TokenStream {
@@ -676,11 +741,23 @@ fn gen_create_table(driver: Driver, table_def: &TableDef) -> proc_macro2::TokenS
 
     quote! {
         /// Creates a new table in the database
-        pub async fn create_table(self, pool: &sqlx::#pool) {
-            sqlx::query(#sql)
-                .execute(pool)
-                .await
-                .unwrap();
+        pub async fn create_table(pool: &sqlx::#pool) -> std::result::Result<(), sqlx::Error> {
+            sqlx::query(#sql).execute(pool).await?;
+            Ok(())
+        }
+    }
+}
+
+fn gen_drop_table(driver: Driver, table: &str) -> proc_macro2::TokenStream {
+    let pool = quote::format_ident!("{}", driver.as_str());
+    let sql = format!("DROP TABLE IF EXISTS {table:?}");
+
+    quote! {
+        /// Deletes the entire table from the database, does nothing if there
+        /// is no such table
+        pub async fn drop_table(pool: &sqlx::#pool) -> std::result::Result<(), sqlx::Error> {
+            sqlx::query(#sql).execute(pool).await?;
+            Ok(())
         }
     }
 }

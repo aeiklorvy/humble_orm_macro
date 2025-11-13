@@ -1,6 +1,6 @@
 [package]
 name = "humble_orm_macro"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 categories = ["database"]
 keywords = ["sqlx", "orm"]
@@ -17,3 +17,6 @@ sqlparser = "0.59"
 convert_case = "0.8"
 quote = "1.0"
 proc-macro2 = "1.0"
+
+[features]
+serde = []

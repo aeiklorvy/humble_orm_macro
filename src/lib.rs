@@ -65,15 +65,8 @@ struct TableColumn {
     is_primary: bool,
 }
 
-struct TableRelation {
-    column: String,
-    rel_table: String,
-    rel_column: String,
-}
-
 struct TableDef {
     cols: Vec<TableColumn>,
-    rels: Vec<TableRelation>,
     create_stmt: sqlparser::ast::Statement,
 }
 
@@ -101,7 +94,6 @@ fn parse_sql(
         if let sqlparser::ast::Statement::CreateTable(sqlparser::ast::CreateTable {
             name,
             columns,
-            constraints,
             ..
         }) = &stmt
         {
@@ -113,7 +105,6 @@ fn parse_sql(
 
             let table_def = tables.entry(table_name).or_insert(TableDef {
                 cols: vec![],
-                rels: vec![],
                 create_stmt: stmt.clone(),
             });
             for col in columns {
@@ -121,7 +112,8 @@ fn parse_sql(
                 let is_nullable = is_column_nullable(col);
 
                 let mut column_type = convert_sql_type(&col.data_type);
-                if is_nullable {
+                if is_nullable && !is_primary {
+                    // the primary key can never be NULL
                     column_type = quote! { Option<#column_type> };
                 }
                 table_def.cols.push(TableColumn {
@@ -129,27 +121,6 @@ fn parse_sql(
                     type_: column_type,
                     is_primary,
                 });
-            }
-
-            for c in constraints {
-                if let sqlparser::ast::TableConstraint::ForeignKey {
-                    columns,
-                    foreign_table,
-                    referred_columns,
-                    ..
-                } = c
-                {
-                    let rel_table = foreign_table
-                        .to_string()
-                        .replace('`', "")
-                        .replace('\"', "")
-                        .replace('\'', "");
-                    table_def.rels.push(TableRelation {
-                        column: columns[0].value.clone(),
-                        rel_table,
-                        rel_column: referred_columns[0].value.clone(),
-                    })
-                }
             }
         }
     }
@@ -161,25 +132,11 @@ fn write_structs(tables: TableMap, driver: Driver) -> proc_macro2::TokenStream {
     let mut structs = vec![];
 
     for (table, def) in tables {
-        let table_escaped = format!("{table:?}");
-
         let fields = gen_model_fields(&def);
         let default_impl = gen_default_impl(&table, &def);
+        let sqltable_impl = gen_sqltable_impl(&table, &def);
         let column_entities = gen_sql_columns(&table, &def);
 
-        let mut all_columns = vec![];
-        for column in &def.cols {
-            // it represents information about the column's entity, so it's
-            // more logical to present it in PascalCase (as with data types)
-            let field_name = quote::format_ident!("{}", column.name.to_case(Case::Pascal));
-            all_columns.push(quote! { #field_name });
-        }
-
-        let fns_related: Vec<_> = def
-            .rels
-            .iter()
-            .map(|rel| gen_get_related_by(driver, &rel))
-            .collect();
         let fn_get_by_primary_key = gen_get_by_primary_key(driver, &table, &def);
         let fn_update = gen_update(driver, &table, &def);
         let fn_delete = gen_delete(driver, &table, &def);
@@ -192,23 +149,19 @@ fn write_structs(tables: TableMap, driver: Driver) -> proc_macro2::TokenStream {
         let type_mod = gen_column_type_mod(&table, &def);
 
         let t = quote::format_ident!("{}", table.to_case(Case::Pascal));
+        let derive = get_struct_derive();
         structs.push(quote! {
-            #[derive(Clone, Debug, sqlx::FromRow)]
+            #derive
             pub struct #t {
                 #(#fields)*
             }
 
             #default_impl
-
-            impl SqlTable for #t {
-                const TABLE_NAME: &'static str = #table_escaped;
-                const COLUMNS: &'static [SqlColumn] = &[#( Self:: #all_columns , )*];
-            }
+            #sqltable_impl
 
             #[allow(non_upper_case_globals)]
             impl #t {
                 #(#column_entities)*
-                #(#fns_related)*
                 #fn_get_by_primary_key
                 #fn_select
                 #fn_update
@@ -338,6 +291,22 @@ fn is_column_nullable(col: &sqlparser::ast::ColumnDef) -> bool {
     true
 }
 
+fn get_struct_derive() -> proc_macro2::TokenStream {
+    #[allow(unused_mut)]
+    let mut impls = vec![
+        quote!(Clone),
+        quote!(Debug),
+        quote!(PartialEq),
+        quote!(sqlx::FromRow),
+    ];
+    #[cfg(feature = "serde")]
+    impls.extend([quote!(serde::Serialize), quote!(serde::Deserialize)]);
+
+    quote! {
+        #[derive( #( #impls ,)* )]
+    }
+}
+
 fn gen_model_fields(table_def: &TableDef) -> Vec<proc_macro2::TokenStream> {
     let mut struct_fields = vec![];
     for column in &table_def.cols {
@@ -407,6 +376,25 @@ fn gen_default_impl(table: &str, table_def: &TableDef) -> proc_macro2::TokenStre
     }
 }
 
+fn gen_sqltable_impl(table: &str, table_def: &TableDef) -> proc_macro2::TokenStream {
+    let mut sql_columns = vec![];
+    for column in &table_def.cols {
+        // it represents information about the column's entity, so it's
+        // more logical to present it in PascalCase (as with data types)
+        let field_name = quote::format_ident!("{}", column.name.to_case(Case::Pascal));
+        sql_columns.push(quote! { #field_name });
+    }
+
+    let t = quote::format_ident!("{}", table.to_case(Case::Pascal));
+    let table_escaped = format!("{table:?}");
+    quote! {
+        impl SqlTable for #t {
+            const TABLE_NAME: &'static str = #table_escaped;
+            const COLUMNS: &'static [SqlColumn] = &[#( Self:: #sql_columns , )*];
+        }
+    }
+}
+
 fn gen_sql_columns(table: &str, table_def: &TableDef) -> Vec<proc_macro2::TokenStream> {
     let table_escaped = format!("{table:?}");
     let mut consts = vec![];
@@ -429,9 +417,11 @@ fn gen_sql_columns(table: &str, table_def: &TableDef) -> Vec<proc_macro2::TokenS
     }
 
     let docs = format!("A special column representing the entire table: `{table:?}.*`");
+    // it represents information about the column's entity, so it's
+    // more logical to present it in PascalCase (as with data types)
     consts.push(quote! {
         #[doc = #docs]
-        pub const ALL: SqlColumn = unsafe {
+        pub const All: SqlColumn = unsafe {
             SqlColumn::new("*", #table_escaped, false)
         };
     });
@@ -446,59 +436,28 @@ fn gen_get_by_primary_key(
 ) -> proc_macro2::TokenStream {
     if let Some(id_col) = table_def.primary_col() {
         let primary_col_name = id_col.name.as_str();
-        let key_type = &id_col.type_;
+        let col_type = &id_col.type_;
         let pool = quote::format_ident!("{}", driver.as_str());
-        let sql = format!("SELECT * FROM {table:?} WHERE {primary_col_name:?} = ?");
+        let fn_name = quote::format_ident!("get_by_{primary_col_name}");
+
+        let sql = format!("SELECT * FROM {table:?} WHERE {primary_col_name:?} = ? LIMIT 1");
 
         quote! {
             /// Selects a row from the database where the primary key corresponds
             /// to the specified value
-            pub async fn get_by_primary_key(pool: &sqlx::#pool, key: #key_type) -> std::result::Result<Self, sqlx::Error> {
+            ///
+            /// Internally, it uses prepared statements, so this is the most
+            /// preferred way to get a single row of the table using the
+            /// primary key
+            pub async fn #fn_name(pool: &sqlx::#pool, value: #col_type) -> std::result::Result<Self, sqlx::Error> {
                 sqlx::query_as(#sql)
-                    .bind(&key)
+                    .bind(&value)
                     .fetch_one(pool)
                     .await
             }
         }
     } else {
         quote! {}
-    }
-}
-
-fn gen_get_related_by(driver: Driver, rel: &TableRelation) -> proc_macro2::TokenStream {
-    let pool = quote::format_ident!("{}", driver.as_str());
-    let fn_name = quote::format_ident!("get_related_by_{}", rel.column.to_case(Case::Snake));
-    let fn_name_all =
-        quote::format_ident!("get_all_related_by_{}", rel.column.to_case(Case::Snake));
-    let model = quote::format_ident!("{}", rel.rel_table.to_case(Case::Pascal));
-    let ref_field = quote::format_ident!("{}", rel.column.to_case(Case::Snake));
-
-    let sql_one = format!(
-        "SELECT * FROM {:?} WHERE {:?} = ? LIMIT 1",
-        rel.rel_table, rel.rel_column
-    );
-    let sql_many = format!(
-        "SELECT * FROM {:?} WHERE {:?} = ?",
-        rel.rel_table, rel.rel_column
-    );
-
-    quote! {
-        /// Selects a row of the related table according to the foreign key
-        /// and field value in the model
-        pub async fn #fn_name(&self, pool: &sqlx::#pool) -> std::result::Result<#model, sqlx::Error> {
-            sqlx::query_as(#sql_one)
-                .bind(&self.#ref_field)
-                .fetch_one(pool)
-                .await
-        }
-        /// Selects all rows of the related table according to the foreign key
-        /// and field value in the model
-        pub async fn #fn_name_all(&self, pool: &sqlx::#pool) -> std::result::Result<std::vec::Vec<#model>, sqlx::Error> {
-            sqlx::query_as(#sql_many)
-                .bind(&self.#ref_field)
-                .fetch_all(pool)
-                .await
-        }
     }
 }
 
@@ -675,11 +634,15 @@ fn gen_insert_without_pk(
         }
     };
 
+    let fn_name = quote::format_ident!(
+        "insert_generating_{}",
+        primary_col.name.to_case(Case::Snake)
+    );
     quote! {
         /// Inserts a record via `INSERT`, skipping the primary key field, and
         /// after insertion sets the primary key value from the DBMS to the
         /// model
-        pub async fn insert_generating_primary_key(&mut self, pool: &sqlx::#pool) -> std::result::Result<(), sqlx::Error> {
+        pub async fn #fn_name(&mut self, pool: &sqlx::#pool) -> std::result::Result<(), sqlx::Error> {
             #fn_body
         }
     }
